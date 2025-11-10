@@ -40,7 +40,7 @@ Este projeto é parte de um Trabalho de Conclusão de Curso (TCC) da **Universid
 ```
 ┌──────────────────────┐
 │   INPUT IMAGE        │
-│   (3 x 640 x 640)   │
+│   (3 x 640 x 640)    │
 └──────────┬───────────┘
            │
     ┌──────▼──────┐

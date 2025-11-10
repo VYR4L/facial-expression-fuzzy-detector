@@ -72,7 +72,6 @@ class Trainer:
             landmarks = batch['landmarks'].to(self.device)
             visibility = batch['visibility'].to(self.device)
             
-            # ✅ CORRIGIDO: autocast atualizado para PyTorch 2.9+
             with autocast('cuda', enabled=self.use_amp):
                 predictions = self.model(images)
                 
@@ -84,7 +83,6 @@ class Trainer:
                 losses = self.criterion(predictions, targets)
                 loss = losses['loss'] / self.accumulation_steps
             
-            # ✅ MIXED PRECISION: Backward com gradient scaling
             if self.use_amp:
                 self.scaler.scale(loss).backward()
             else:
@@ -97,13 +95,12 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    self.optimizer.zero_grad()  # ← Zerar aqui
                 else:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.optimizer.step()
-                
-                self.optimizer.zero_grad()
+                    self.optimizer.zero_grad()  # ← Zerar aqui
             
-            # ✅ LIMPAR CACHE A CADA 10 BATCHES
             if (batch_idx + 1) % 10 == 0:
                 torch.cuda.empty_cache()
             
@@ -119,12 +116,17 @@ class Trainer:
                 'conf': f'{losses["conf_loss"]:.3f}'
             })
         
-        # Limpar gradientes restantes
-        if self.use_amp:
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            self.optimizer.step()
+        remaining_batches = len(self.train_loader) % self.accumulation_steps
+        if remaining_batches != 0:
+            if self.use_amp:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+        
         self.optimizer.zero_grad()
         
         num_batches = len(self.train_loader)
