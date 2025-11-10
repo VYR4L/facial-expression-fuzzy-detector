@@ -1,6 +1,7 @@
 from .settings import (
     # Default configuration constants
     IBUG_LANDMARKS,
+    REGION_LANDMARK_INDICES,
     DEFAULT_IMAGE_CONFIG,
     DEFAULT_MODEL_CONFIG,
     DEFAULT_TRAINING_CONFIG,

@@ -65,6 +65,18 @@ IBUG_LANDMARKS: List[LandmarkPoint] = [
     LandmarkPoint("Boca", (49, 68)),
 ]
 
+# Mapeamento de regiões para índices de landmarks
+REGION_LANDMARK_INDICES: Dict[str, List[int]] = {
+    'Contorno_Facial': list(range(0, 17)),           # Pontos 0-16
+    'Sobrancelha_Direita': list(range(17, 22)),      # Pontos 17-21
+    'Sobrancelha_Esquerda': list(range(22, 27)),     # Pontos 22-26
+    'Nariz': list(range(27, 36)),                    # Pontos 27-35
+    'Olho_Direito': list(range(36, 42)),             # Pontos 36-41
+    'Olho_Esquerdo': list(range(42, 48)),            # Pontos 42-47
+    'Boca_Externa': list(range(48, 60)),             # Pontos 48-59
+    'Boca_Interna': list(range(60, 68))              # Pontos 60-67
+}
+
 DEFAULT_IMAGE_CONFIG = ImageConfig(
     width=640,
     height=640,

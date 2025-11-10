@@ -3,6 +3,7 @@ from utils.dataset_loader import LandmarkDataset, create_dataloader
 from utils.trainer import Trainer
 from utils.evaluator import Evaluator
 from utils.inference import LandmarkPredictor
+from utils.metrics import LandmarkMetrics
 
 __all__ = [
     'WingLoss',
@@ -12,5 +13,6 @@ __all__ = [
     'create_dataloader',
     'Trainer',
     'Evaluator',
-    'LandmarkPredictor'
+    'LandmarkPredictor',
+    'LandmarkMetrics'
 ]
