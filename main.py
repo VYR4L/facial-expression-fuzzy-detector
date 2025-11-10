@@ -112,6 +112,16 @@ def train_model(args):
         patience=10
     )
     
+    # ✅ CALCULAR ACCUMULATION STEPS
+    # Se batch_size < 16, acumular gradientes para simular batch maior
+    effective_batch_size = 32  # Batch size efetivo desejado
+    accumulation_steps = max(1, effective_batch_size // args.batch_size)
+    
+    print(f"\n⚙️  Gradient Accumulation:")
+    print(f"   Batch size: {args.batch_size}")
+    print(f"   Accumulation steps: {accumulation_steps}")
+    print(f"   Effective batch size: {args.batch_size * accumulation_steps}")
+    
     # Criar e executar trainer
     trainer = Trainer(
         model=model,
@@ -122,7 +132,8 @@ def train_model(args):
         scheduler=scheduler,
         device=device,
         num_epochs=args.epochs,
-        save_dir=args.save_dir
+        save_dir=args.save_dir,
+        accumulation_steps=accumulation_steps
     )
     
     trainer.train()
