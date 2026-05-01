@@ -1,327 +1,240 @@
-import os
+"""
+dataset_loader.py — Dataset DISFA+ para detecção de Action Units.
+
+Estrutura esperada em disco:
+    datasets/archive/
+    ├── Images/
+    │   └── SN001/SN001/<sessão>/<frame>.jpg
+    └── Labels/
+        └── SN001/SN001/<sessão>/AUXX.txt
+
+Cada AUXX.txt tem uma linha por frame:
+    000.jpg     0
+    001.jpg     1
+    ...
+"""
+import re
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-import json
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-import cv2
-import pandas as pd
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
 
-from config.settings import (
-    IBUG_LANDMARKS,
-    DEFAULT_IMAGE_CONFIG,
-    ImageConfig,
-    get_dataset_path
-)
+from config.settings import AU_NAMES, DISFA_DIR, DEFAULT_IMAGE_CONFIG, ImageConfig
+
+# ─── Sujeitos presentes no dataset DISFA+ ────────────────────────────────────
+DISFA_SUBJECTS = [
+    'SN001', 'SN003', 'SN004', 'SN007', 'SN009',
+    'SN010', 'SN013', 'SN025', 'SN027',
+]
 
 
-class LandmarkDataset(Dataset):
+def _parse_label_file(path: Path) -> dict[str, float]:
     """
-    Dataset para carregar imagens com landmarks faciais anotados.
-
-    Formatos suportados:
-    1. JSON format: {"image_path": "path/to/image.jpg", "landmarks": [[x1, y1], [x2, y2], ...]}
-    2. PTS format: Arquivo de texto .pts com coordenadas dos landmarks.
-    3. CSV format: "image_path,x1,y1,x2,y2,...,x68,y68,v1,v2,...,v68".
+    Lê um arquivo de rótulo AUXX.txt e retorna {frame_stem: intensity}.
     """
+    labels: dict[str, float] = {}
+    for line in path.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = re.split(r'\s+', line, maxsplit=1)
+        if len(parts) != 2:
+            continue
+        fname, val = parts
+        stem = Path(fname).stem  # '000', '001', …
+        try:
+            labels[stem] = float(val)
+        except ValueError:
+            continue
+    return labels
+
+
+def _collect_samples(
+    images_dir: Path,
+    labels_dir: Path,
+    subjects: list[str],
+) -> list[dict]:
+    """
+    Percorre todos os sujeitos/sessões e monta a lista de amostras.
+
+    Cada amostra é:
+        {'image_path': Path, 'au_intensities': ndarray(12,)}
+    """
+    samples: list[dict] = []
+
+    for subject in subjects:
+        img_subj_dir = images_dir / subject / subject
+        lbl_subj_dir = labels_dir / subject / subject
+
+        if not img_subj_dir.is_dir():
+            continue
+
+        for session_dir in sorted(img_subj_dir.iterdir()):
+            if not session_dir.is_dir():
+                continue
+            session = session_dir.name
+            lbl_session_dir = lbl_subj_dir / session
+
+            # Carregar intensidades de cada AU (se arquivo existir, senão 0)
+            au_labels: dict[str, dict[str, float]] = {}
+            for au_name in AU_NAMES:
+                lbl_file = lbl_session_dir / f"{au_name}.txt"
+                if lbl_file.is_file():
+                    au_labels[au_name] = _parse_label_file(lbl_file)
+                else:
+                    au_labels[au_name] = {}
+
+            # Enumerar imagens da sessão
+            for img_path in sorted(session_dir.glob('*.jpg')):
+                stem = img_path.stem
+                intensities = np.zeros(len(AU_NAMES), dtype=np.float32)
+                for idx, au_name in enumerate(AU_NAMES):
+                    intensities[idx] = au_labels[au_name].get(stem, 0.0)
+
+                samples.append({
+                    'image_path': img_path,
+                    'au_intensities': intensities,
+                })
+
+    return samples
+
+
+class DisfaDataset(Dataset):
+    """
+    Dataset DISFA+ para detecção de Action Units.
+
+    Args:
+        subjects:   lista de IDs de sujeito (ex: ['SN001', 'SN003']).
+                    Se None, usa todos os 9 sujeitos.
+        img_config: configuração de imagem (tamanho, normalização).
+        augment:    se True, aplica augmentações aleatórias (flip, color jitter).
+        disfa_dir:  diretório raiz do dataset (padrão: DISFA_DIR da config).
+    """
+
     def __init__(
         self,
-        root_dir: str,
-        annotation_file: str,
-        format: str = 'json',
-        image_config: Optional[ImageConfig] = None,
-        transform=None,
-        augment=False
+        subjects: Optional[list[str]] = None,
+        img_config: Optional[ImageConfig] = None,
+        augment: bool = False,
+        disfa_dir: Optional[Path] = None,
     ):
-        """
-        Args:
-            root_dir (str): Diretório raiz onde as imagens estão armazenadas.
-            annotation_file (str): Caminho para o arquivo de anotações.
-            format (str): Formato do arquivo de anotações ('json', 'pts', 'csv').
-            image_config (ImageConfig, opcional): Configurações para pré-processamento de imagens.
-            transform (callable, opcional): Transformações a serem aplicadas nas imagens.
-            augment (bool): Se True, aplica aumentos de dados nas imagens.
-        """
-        self.root_dir = root_dir
-        self.annotation_file = annotation_file
-        self.format = format
-        self.image_config = image_config or DEFAULT_IMAGE_CONFIG
-        self.transform = transform
+        self.img_config = img_config or DEFAULT_IMAGE_CONFIG
         self.augment = augment
 
-        self.samples = self._load_annotations()
+        root = Path(disfa_dir) if disfa_dir else DISFA_DIR
+        images_dir = root / 'Images'
+        labels_dir = root / 'Labels'
+        used_subjects = subjects or DISFA_SUBJECTS
 
-    def _load_annotations(self) -> List[Dict]:
-        match self.format:
-            case 'json':
-                return self._load_json_annotations()
-            case 'pts':
-                return self._load_pts_annotations()
-            case 'csv':
-                return self._load_csv_annotations()
-            case _:
-                raise ValueError(f"Formato de anotação não suportado: {self.format}")
-            
-    def _load_json_annotations(self) -> List[Dict]:
-        with open(self.annotation_file, 'r') as f:
-            data = json.load(f)
-        samples = []
-        for item in data:
-            image_path = os.path.join(self.root_dir, item['image_path'])
-            landmarks = np.array(item['landmarks'], dtype=np.float32)
-            visibility = np.array(item.get('visibility', [1]*68), dtype=np.float32)
-            bbox = item.get('bbox', None)
-            samples.append({
-                'image_path': str(image_path),
-                'landmarks': landmarks,
-                'visibility': visibility,
-                'bbox': bbox
-            })
-        return samples
-    
-    def _load_pts_annotations(self) -> List[Dict]:
-        samples = []
-        
-        # Suportar múltiplos subdiretórios (01_Indoor, 02_Outdoor, etc)
-        root_path = Path(self.root_dir)
-        
-        # Se root_dir contém subdiretórios, processar recursivamente
-        if any(root_path.iterdir()):
-            image_extensions = ['.png', '.jpg', '.jpeg']
-            
-            # Buscar recursivamente por imagens
-            for ext in image_extensions:
-                for img_file in root_path.rglob(f'*{ext}'):
-                    pts_file = img_file.with_suffix('.pts')
-                    
-                    if not pts_file.exists():
-                        continue
-                    
-                    # Ler arquivo .pts
-                    with open(pts_file, 'r') as f:
-                        lines = f.readlines()
-                    
-                    # Extrair landmarks (pular header e footer)
-                    landmarks = []
-                    reading = False
-                    for line in lines:
-                        line = line.strip()
-                        if line == '{':
-                            reading = True
-                            continue
-                        if line == '}':
-                            break
-                        if reading:
-                            try:
-                                x, y = map(float, line.split())
-                                landmarks.append([x, y])
-                            except ValueError:
-                                continue
-                    
-                    if len(landmarks) == 68:  # Validar 68 landmarks
-                        landmarks = np.array(landmarks, dtype=np.float32)
-                        visibility = np.ones(len(landmarks), dtype=np.float32)
-                        
-                        samples.append({
-                            'image_path': str(img_file),
-                            'landmarks': landmarks,
-                            'visibility': visibility,
-                            'bbox': None
-                        })
-        
-        return samples
-    
-    def _load_csv_annotations(self) -> List[Dict]:
-        df = pd.read_csv(self.annotation_file)
-        samples = []
-        
-        for _, row in df.iterrows():
-            image_path = os.path.join(self.root_dir, row['image_path'])
-            landmarks = []
-            visibility = []
-            
-            for i in range(68):
-                x = row[f'x{i+1}']
-                y = row[f'y{i+1}']
-                v = row.get(f'v{i+1}', 1)  # Visibilidade padrão como 1
-                landmarks.append([x, y])
-                visibility.append(v)
-            
-            landmarks = np.array(landmarks, dtype=np.float32)
-            visibility = np.array(visibility, dtype=np.float32)
-            
-            samples.append({
-                'image_path': str(image_path),
-                'landmarks': landmarks,
-                'visibility': visibility,
-                'bbox': None
-            })
-        
-        return samples
-    
+        self.samples = _collect_samples(images_dir, labels_dir, used_subjects)
+        if not self.samples:
+            raise RuntimeError(
+                f"Nenhuma amostra encontrada em {root}. "
+                "Verifique a estrutura do dataset DISFA+."
+            )
+
+        # Transformações de imagem
+        h, w = self.img_config.height, self.img_config.width
+        aug_transforms = [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
+        ] if augment else []
+
+        self.transform = transforms.Compose([
+            transforms.Resize((h, w)),
+            *aug_transforms,
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=list(self.img_config.mean),
+                std=list(self.img_config.std),
+            ),
+        ])
+
+    # ── Estatísticas para pos_weight BCE ──────────────────────────────────────
+    def compute_pos_weight(self, device: str = 'cpu') -> torch.Tensor:
+        """
+        Calcula pos_weight por AU para BCEWithLogitsLoss.
+        pos_weight[i] = (nº frames negativos) / (nº frames positivos + ε)
+        """
+        all_binary = np.stack([
+            (s['au_intensities'] > 0).astype(np.float32)
+            for s in self.samples
+        ])  # (N, 12)
+        pos = all_binary.sum(axis=0)
+        neg = len(self.samples) - pos
+        pw = neg / (pos + 1e-6)
+        return torch.tensor(pw, dtype=torch.float32, device=device)
+
+    # ── Dataset interface ──────────────────────────────────────────────────────
     def __len__(self) -> int:
         return len(self.samples)
-    
-    def __getitem__(self, idx: int) -> Dict:
+
+    def __getitem__(self, idx: int) -> dict:
         sample = self.samples[idx]
-        
-        # Carregar imagem
-        image = Image.open(sample['image_path']).convert('RGB')
-        original_size = image.size  # (W, H)
-        
-        # Landmarks originais
-        landmarks = sample['landmarks'].copy()
-        visibility = sample['visibility'].copy()
-        
-        # Redimensionar imagem
-        image = image.resize(
-            (self.image_config.width, self.image_config.height),
-            Image.BILINEAR
-        )
-        
-        # Normalizar coordenadas dos landmarks
-        landmarks[:, 0] = landmarks[:, 0] / original_size[0]  # Normalizar X
-        landmarks[:, 1] = landmarks[:, 1] / original_size[1]  # Normalizar Y
-        
-        # Converter para tensor
-        image = np.array(image, dtype=np.float32) / 255.0
-        
-        # Aplicar normalização ImageNet se configurado
-        if self.image_config.normalize:
-            mean = np.array(self.image_config.mean).reshape(1, 1, 3)
-            std = np.array(self.image_config.std).reshape(1, 1, 3)
-            image = (image - mean) / std
-        
-        # Transpor para (C, H, W)
-        image = np.transpose(image, (2, 0, 1))
-        
-        # Data augmentation (se habilitado)
-        if self.augment:
-            image, landmarks, visibility = self._apply_augmentation(
-                image, landmarks, visibility
-            )
-        
-        # Aplicar transformações customizadas
-        if self.transform is not None:
-            image = self.transform(image)
-        
+        img = Image.open(sample['image_path']).convert('RGB')
+        img_tensor = self.transform(img)
+
+        intensities = torch.tensor(sample['au_intensities'], dtype=torch.float32)
+        binary = (intensities > 0).float()
+
         return {
-            'image': torch.from_numpy(image).float(),
-            'landmarks': torch.from_numpy(landmarks).float(),
-            'visibility': torch.from_numpy(visibility).float(),
-            'original_size': original_size
+            'image':     img_tensor,       # (3, H, W)
+            'binary':    binary,           # (12,) 0/1
+            'intensity': intensities,      # (12,) 0–3
         }
 
-    def _apply_augmentation(
-        self,
-        image: np.ndarray,
-        landmarks: np.ndarray,
-        visibility: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Aplica data augmentation
-        
-        Augmentations aplicados:
-        - Random horizontal flip
-        - Random brightness/contrast
-        - Random rotation (pequeno ângulo)
-        - Random noise
-        """
-        # Horizontal flip (50% chance)
-        if np.random.rand() > 0.5:
-            image = np.flip(image, axis=2).copy()  # Flip horizontal (W axis)
-            landmarks[:, 0] = 1.0 - landmarks[:, 0]  # Inverter coordenadas X
-            
-            # Trocar landmarks espelhados (ex: olho esquerdo ↔ olho direito)
-            landmarks = self._swap_mirrored_landmarks(landmarks)
-        
-        # Random brightness/contrast
-        if np.random.rand() > 0.5:
-            alpha = np.random.uniform(0.8, 1.2)  # Contraste
-            beta = np.random.uniform(-0.1, 0.1)  # Brilho
-            image = np.clip(image * alpha + beta, 0, 1)
-        
-        # Random noise
-        if np.random.rand() > 0.7:
-            noise = np.random.normal(0, 0.02, image.shape)
-            image = np.clip(image + noise, 0, 1)
-        
-        return image, landmarks, visibility
 
-    def _swap_mirrored_landmarks(self, landmarks: np.ndarray) -> np.ndarray:
-        """
-        Troca landmarks espelhados após flip horizontal
-        
-        Baseado no mapeamento iBUG:
-        - Sobrancelhas: esquerda (18-22) ↔ direita (23-27)
-        - Olhos: esquerdo (37-42) ↔ direito (43-48)
-        - Contorno facial é simétrico
-        """
-        swapped = landmarks.copy()
-        
-        # Sobrancelhas
-        swapped[17:22], swapped[22:27] = landmarks[22:27].copy(), landmarks[17:22].copy()
-        
-        # Olhos
-        swapped[36:42], swapped[42:48] = landmarks[42:48].copy(), landmarks[36:42].copy()
-        
-        # Nariz (31-36 são simétricos)
-        swapped[31:36] = landmarks[[35, 34, 33, 32, 31]].copy()
-        
-        # Boca externa (49-60 são simétricos)
-        mouth_outer = [54, 53, 52, 51, 50, 49, 60, 59, 58, 57, 56, 55]
-        swapped[48:60] = landmarks[[48 + i for i in mouth_outer]].copy()
-        
-        # Boca interna (61-68 são simétricos)
-        mouth_inner = [64, 63, 62, 61, 68, 67, 66, 65]
-        swapped[60:68] = landmarks[[60 + i for i in mouth_inner]].copy()
-        
-        return swapped
+# ─── Factory ─────────────────────────────────────────────────────────────────
 
-
-def create_dataloader(
-    root_dir: str,
-    annotation_file: str,
+def create_dataloaders(
+    subjects_train: Optional[list[str]] = None,
+    subjects_val: Optional[list[str]] = None,
+    img_config: Optional[ImageConfig] = None,
     batch_size: int = 32,
-    shuffle: bool = True,
     num_workers: int = 4,
-    format: str = 'json',
-    image_config: Optional[ImageConfig] = None,
-    augment: bool = False
-) -> DataLoader:
+    disfa_dir: Optional[Path] = None,
+) -> tuple[DataLoader, DataLoader]:
     """
-    Cria um DataLoader para o dataset de landmarks
-    
-    Args:
-        root_dir: Diretório raiz do dataset
-        annotation_file: Arquivo de anotações
-        batch_size: Tamanho do batch
-        shuffle: Embaralhar dados
-        num_workers: Número de workers para carregamento paralelo
-        format: Formato das anotações
-        image_config: Configurações de imagem
-        augment: Habilitar data augmentation
-    
-    Returns:
-        DataLoader configurado
+    Cria DataLoaders de treino e validação.
+
+    Se subjects_val for None, usa o último sujeito da lista de treino para validação.
+    Se subjects_train for None, usa os primeiros 8 sujeitos para treino e o 9º para val.
     """
-    dataset = LandmarkDataset(
-        root_dir=root_dir,
-        annotation_file=annotation_file,
-        format=format,
-        image_config=image_config,
-        augment=augment
+    if subjects_train is None and subjects_val is None:
+        subjects_train = DISFA_SUBJECTS[:-1]   # primeiros 8
+        subjects_val   = DISFA_SUBJECTS[-1:]   # último
+
+    train_ds = DisfaDataset(
+        subjects=subjects_train,
+        img_config=img_config,
+        augment=True,
+        disfa_dir=disfa_dir,
     )
-    
-    dataloader = DataLoader(
-        dataset,
+    val_ds = DisfaDataset(
+        subjects=subjects_val,
+        img_config=img_config,
+        augment=False,
+        disfa_dir=disfa_dir,
+    )
+
+    train_loader = DataLoader(
+        train_ds,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
     )
-    
-    return dataloader
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader

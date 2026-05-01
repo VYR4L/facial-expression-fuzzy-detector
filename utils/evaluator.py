@@ -1,106 +1,81 @@
 """
-Evaluator - Avaliação e Testes do Modelo
-
-Responsável por:
-- Testes do modelo
-- Métricas de avaliação
-- Inferência
+evaluator.py — Avalia um modelo AU em um DataLoader e persiste os resultados.
 """
+from pathlib import Path
 
 import torch
-from tqdm import tqdm
-from pathlib import Path
-from utils.metrics import LandmarkMetrics
+from torch.utils.data import DataLoader
+
+from utils.metrics import AUMetrics
 
 
 class Evaluator:
     """
-    Classe para avaliar o modelo
+    Avalia um modelo de Action Units num DataLoader.
+
+    Args:
+        model:      instância do YOLOv11AUDetector (ou compatível)
+        device:     'cuda' ou 'cpu'
+        results_dir: diretório onde salvar os relatórios
     """
-    def __init__(self, model, criterion, device):
+
+    def __init__(self, model: torch.nn.Module, device: str = 'cpu',
+                 results_dir: str | Path = 'results'):
         self.model = model
-        self.criterion = criterion
         self.device = device
-        self.metrics = LandmarkMetrics()
+        self.results_dir = Path(results_dir)
+        self.results_dir.mkdir(parents=True, exist_ok=True)
 
     @torch.no_grad()
-    def evaluate(self, test_loader, save_visualizations=True, save_dir='results'):
+    def evaluate(self, loader: DataLoader, threshold: float = 0.5) -> dict:
         """
-        Avalia o modelo no dataset de teste
-        
+        Roda inferência em todos os batches do loader e calcula métricas.
+
         Args:
-            test_loader: DataLoader com dados de teste
-            save_visualizations: Se True, salva gráficos
-            save_dir: Diretório para salvar resultados
-        
+            loader:    DataLoader com batches {'image', 'binary', 'intensity'}
+            threshold: limiar para decisão binária
+
         Returns:
-            dict com todas as métricas
+            dict de métricas (ver AUMetrics.compute())
         """
         self.model.eval()
-        self.metrics.reset()
-        
-        total_loss = 0
-        pbar = tqdm(test_loader, desc='Avaliando')
-        
-        for batch in pbar:
-            images = batch['image'].to(self.device)
-            landmarks = batch['landmarks'].to(self.device)
-            visibility = batch['visibility'].to(self.device)
-            
-            # Forward pass
-            predictions = self.model(images)
-            
-            # Extrair predições
-            pred_landmarks = predictions[:, :, :2]  # (B, 68, 2)
-            pred_confidence = torch.sigmoid(predictions[:, :, 2])  # (B, 68)
-            
-            # Calcular loss
-            targets = {
-                'landmarks': landmarks,
-                'visibility': visibility
-            }
-            losses = self.criterion(predictions, targets)
-            total_loss += losses['loss'].item()
-            
-            # Atualizar métricas
-            self.metrics.update(pred_landmarks, landmarks, pred_confidence)
-            
-            pbar.set_postfix({'loss': losses['loss'].item()})
-        
-        avg_loss = total_loss / len(test_loader)
-        
-        # Calcular todas as métricas
-        nme = self.metrics.compute_nme()
-        auc = self.metrics.compute_auc()
-        fr = self.metrics.compute_failure_rate()
-        pr = self.metrics.compute_precision_recall()
-        
-        # Salvar visualizações
-        if save_visualizations:
-            save_path = Path(save_dir)
-            save_path.mkdir(exist_ok=True, parents=True)
-            
-            print(f"\n📊 Gerando visualizações...")
-            self.metrics.plot_error_distribution(save_path / 'error_distribution.png')
-            self.metrics.plot_confusion_heatmap(save_path / 'region_correlation.png')
-            print(f"✅ Visualizações salvas em: {save_path}")
-        
-        return {
-            'loss': avg_loss,
-            'nme': nme,
-            'auc': auc,
-            'failure_rate': fr,
-            'precision_recall': pr
-        }
+        self.model.to(self.device)
+        metrics = AUMetrics()
 
-    def print_results(self, results):
-        """Imprime relatório de resultados"""
-        report = self.metrics.generate_report()
-        print(report)
-        
-        # Salvar relatório em arquivo
-        save_path = Path('results/evaluation_report.txt')
-        save_path.parent.mkdir(exist_ok=True, parents=True)
-        with open(save_path, 'w', encoding='utf-8') as f:
-            f.write(report)
-        print(f"\n📄 Relatório salvo em: {save_path}")
+        for batch in loader:
+            images     = batch['image'].to(self.device)
+            binary     = batch['binary'].to(self.device)
+            intensity  = batch['intensity'].to(self.device)
+
+            predictions = self.model(images)
+            metrics.update(
+                predictions,
+                {'binary': binary, 'intensity': intensity},
+                threshold=threshold,
+            )
+
+        return metrics.compute()
+
+    def evaluate_and_save(
+        self,
+        loader: DataLoader,
+        filename: str = 'evaluation_report.txt',
+        threshold: float = 0.5,
+    ) -> dict:
+        """
+        Avalia e grava um relatório em texto no diretório de resultados.
+
+        Returns:
+            dict de métricas
+        """
+        results = self.evaluate(loader, threshold=threshold)
+
+        report_path = self.results_dir / filename
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write("=== Action Unit Detection — Evaluation Report ===\n\n")
+            f.write(AUMetrics.format_summary(results))
+            f.write("\n\n--- Detailed Classification Report ---\n")
+            f.write(results['classification_report'])
+
+        print(f"Relatório salvo em: {report_path}")
+        return results

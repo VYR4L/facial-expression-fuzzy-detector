@@ -1,128 +1,89 @@
 """
-Main - Sistema de Detecção de Landmarks Faciais com YOLOv11
+main.py — YOLOv11 para Detecção de Action Units (FACS)
 
 Uso:
-    python main.py --mode train --epochs 100 --batch-size 32
-    python main.py --mode test --weights best.pth
-    python main.py --mode demo --image path/to/face.jpg
+    python main.py --mode train --epochs 50 --batch-size 4
+    python main.py --mode test  --weights checkpoints/best_model.pth
+    python main.py --mode demo  --image caminho/para/foto.jpg
 """
 
 import argparse
 import torch
-from torch.utils.data import DataLoader, random_split
 from pathlib import Path
 
-# Importar componentes do projeto
-from core import YOLOv11LandmarkDetector
-from utils import LandmarkDataset, LandmarkLoss, Trainer, Evaluator, LandmarkPredictor
-from config import DEFAULT_IMAGE_CONFIG
+from config import DEFAULT_IMAGE_CONFIG, DEFAULT_MODEL_CONFIG, DEFAULT_TRAINING_CONFIG
+from core import YOLOv11AUDetector
+from utils import DisfaDataset, AULoss, Trainer, Evaluator, AUPredictor
+from utils.dataset_loader import create_dataloaders, DISFA_SUBJECTS
 
+
+# ─── Construtores ─────────────────────────────────────────────────────────────
 
 def setup_model_and_criterion(args, device):
-    """Configura modelo e função de loss"""
-    model = YOLOv11LandmarkDetector(
+    """Instancia o modelo AU e a função de perda."""
+    model = YOLOv11AUDetector(
         in_channels=3,
         base_channels=args.base_channels,
-        num_landmarks=68
     ).to(device)
-    
-    criterion = LandmarkLoss(
-        wing_omega=10.0,
-        wing_epsilon=2.0,
-        lambda_coord=5.0,
-        lambda_conf=1.0,
-        use_weights=True
+
+    # pos_weight calculado a partir do dataset de treino
+    # (None → BCE sem pesos; será sobrescrito durante setup_dataloaders quando possível)
+    criterion = AULoss(
+        pos_weight=None,
+        lambda_binary=1.0,
+        lambda_intensity=0.5,
     )
-    
+
     return model, criterion
 
 
 def setup_dataloaders(args):
-    """Configura dataloaders para treino e validação"""
-    # Carregar dataset
-    print("\n📂 Carregando dataset...")
-    full_dataset = LandmarkDataset(
-        root_dir=args.data_dir,
-        annotation_file="",
-        format='pts',
-        image_config=DEFAULT_IMAGE_CONFIG,
-        augment=True
-    )
-    
-    # Split treino/validação
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
-    )
-    
-    # Desabilitar augmentation no dataset de validação
-    val_dataset.dataset.augment = False
-    
-    # Criar dataloaders
-    train_loader = DataLoader(
-        train_dataset,
+    """Cria DataLoaders de treino e validação a partir do DISFA+."""
+    print("\n📂 Carregando dataset DISFA+...")
+    train_loader, val_loader = create_dataloaders(
+        img_config=DEFAULT_IMAGE_CONFIG,
         batch_size=args.batch_size,
-        shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
     )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=False
-    )
-    
+    print(f"   Treino : {len(train_loader.dataset):>6} amostras")
+    print(f"   Val    : {len(val_loader.dataset):>6} amostras")
     return train_loader, val_loader
 
 
+# ─── Modos ────────────────────────────────────────────────────────────────────
+
 def train_model(args):
-    """Função principal de treinamento"""
+    """Loop completo de treinamento."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🖥️  Device: {device}")
-    
-    # Configurar componentes
+
     train_loader, val_loader = setup_dataloaders(args)
     model, criterion = setup_model_and_criterion(args, device)
-    
-    # Carregar checkpoint se especificado
+
+    # Atualizar pos_weight com base no dataset de treino
+    pos_weight = train_loader.dataset.compute_pos_weight(device=str(device))
+    criterion.bce = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction='mean')
+
+    # Retomar treinamento se solicitado
     if args.resume:
-        print(f"📥 Carregando checkpoint: {args.resume}")
+        print(f"📥 Retomando checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
-    
-    # Criar optimizer e scheduler
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
-        weight_decay=args.weight_decay
+        weight_decay=args.weight_decay,
     )
-    
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=0.5,
-        patience=10
+        optimizer, mode='min', factor=0.5, patience=5
     )
-    
-    # ✅ CALCULAR ACCUMULATION STEPS
-    # Se batch_size < 16, acumular gradientes para simular batch maior
-    effective_batch_size = 32  # Batch size efetivo desejado
-    accumulation_steps = max(1, effective_batch_size // args.batch_size)
-    
-    print(f"\n⚙️  Gradient Accumulation:")
-    print(f"   Batch size: {args.batch_size}")
-    print(f"   Accumulation steps: {accumulation_steps}")
-    print(f"   Effective batch size: {args.batch_size * accumulation_steps}")
-    
-    # Criar e executar trainer
+
+    effective_batch = 32
+    accumulation_steps = max(1, effective_batch // args.batch_size)
+    print(f"\n⚙️  Gradient Accumulation: {accumulation_steps}x "
+          f"(effective batch = {args.batch_size * accumulation_steps})")
+
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
@@ -133,132 +94,115 @@ def train_model(args):
         device=device,
         num_epochs=args.epochs,
         save_dir=args.save_dir,
-        accumulation_steps=accumulation_steps
+        accumulation_steps=accumulation_steps,
+        use_amp=True,
     )
-    
     trainer.train()
 
 
 def test_model(args):
-    """Função para testar o modelo"""
+    """Avalia o modelo num set de teste e grava relatório."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+
     print("=" * 70)
-    print("Testando Modelo YOLOv11 para Landmarks Faciais")
+    print("Avaliação — YOLOv11 Action Units")
     print("=" * 70)
-    
-    # Carregar modelo e critério
-    model, criterion = setup_model_and_criterion(args, device)
-    
+
+    model, _ = setup_model_and_criterion(args, device)
+
     print(f"\n📥 Carregando pesos: {args.weights}")
     checkpoint = torch.load(args.weights, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
-    
-    # Carregar dataset de teste
-    print("\n📂 Carregando dataset de teste...")
-    test_dataset = LandmarkDataset(
-        root_dir=args.data_dir,
-        annotation_file="",
-        format='pts',
-        image_config=DEFAULT_IMAGE_CONFIG,
-        augment=False
-    )
-    
-    test_loader = DataLoader(
-        test_dataset,
+
+    # Usar o último sujeito como set de teste (separado do treino)
+    from utils.dataset_loader import create_dataloaders
+    _, test_loader = create_dataloaders(
+        subjects_val=[DISFA_SUBJECTS[-1]],
+        img_config=DEFAULT_IMAGE_CONFIG,
         batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
     )
-    
-    # Criar evaluator e avaliar
-    evaluator = Evaluator(model, criterion, device)
-    results = evaluator.evaluate(test_loader)
-    evaluator.print_results(results)
+
+    evaluator = Evaluator(model, device=str(device), results_dir='results')
+    results = evaluator.evaluate_and_save(test_loader)
+
+    from utils.metrics import AUMetrics
+    print("\n" + AUMetrics.format_summary(results))
 
 
 def demo(args):
-    """Demonstração com uma imagem"""
+    """Demonstração AU em imagem completa (com detecção de rosto via MediaPipe)."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+
     print("=" * 70)
-    print("Demo - Detecção de Landmarks Faciais")
+    print("Demo — Detecção de Action Units")
     print("=" * 70)
-    
-    # Carregar modelo
+
     model, _ = setup_model_and_criterion(args, device)
-    
+
     print(f"\n📥 Carregando pesos: {args.weights}")
     checkpoint = torch.load(args.weights, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
-    
-    # Criar predictor
-    predictor = LandmarkPredictor(model, device, image_size=640)
-    
-    # Predizer e salvar
-    predictor.predict_and_save(
-        args.image,
-        args.output,
-        args.conf_threshold
+
+    predictor = AUPredictor(
+        model,
+        device=str(device),
+        threshold=args.conf_threshold,
+        img_config=DEFAULT_IMAGE_CONFIG,
     )
-    
+
+    print(f"\n🔍 Analisando: {args.image}")
+    face_results = predictor.predict_image(args.image)
+
+    from utils.inference import format_au_results
+    report = format_au_results(face_results)
+    print("\n" + report)
+
+    if args.output:
+        Path(args.output).write_text(report, encoding='utf-8')
+        print(f"\n💾 Resultado salvo em: {args.output}")
+
     print("=" * 70)
 
 
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser(description='YOLOv11 Facial Landmarks Detection')
-    
-    # Modo de operação
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test', 'demo'],
-                        help='Modo de operação')
-    
-    # Dataset
-    parser.add_argument('--data-dir', type=str, default='datasets/300W',
-                        help='Diretório do dataset')
-    
+    parser = argparse.ArgumentParser(
+        description='YOLOv11 — Detecção de Action Units (FACS / DISFA+)'
+    )
+
+    parser.add_argument('--mode', default='train', choices=['train', 'test', 'demo'])
+
     # Modelo
-    parser.add_argument('--base-channels', type=int, default=64,
-                        help='Canais base da backbone')
-    parser.add_argument('--weights', type=str, default='checkpoints/best_model.pth',
-                        help='Caminho para os pesos do modelo')
-    parser.add_argument('--resume', type=str, default='',
-                        help='Retomar treinamento de checkpoint')
-    
+    parser.add_argument('--base-channels', type=int, default=64)
+    parser.add_argument('--weights', default='checkpoints/best_model.pth')
+    parser.add_argument('--resume', default='')
+
     # Treinamento
-    parser.add_argument('--epochs', type=int, default=100,
-                        help='Número de épocas')
-    parser.add_argument('--batch-size', type=int, default=16,
-                        help='Tamanho do batch')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='Learning rate inicial')
-    parser.add_argument('--weight-decay', type=float, default=1e-4,
-                        help='Weight decay')
-    parser.add_argument('--num-workers', type=int, default=4,
-                        help='Número de workers para DataLoader')
-    parser.add_argument('--save-dir', type=str, default='checkpoints',
-                        help='Diretório para salvar checkpoints')
-    
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--batch-size', type=int, default=4)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--weight-decay', type=float, default=1e-4)
+    parser.add_argument('--num-workers', type=int, default=0)
+    parser.add_argument('--save-dir', default='checkpoints')
+
     # Demo
-    parser.add_argument('--image', type=str, default='',
-                        help='Caminho da imagem para demo')
-    parser.add_argument('--output', type=str, default='',
-                        help='Caminho para salvar resultado')
-    parser.add_argument('--conf-threshold', type=float, default=0.5,
-                        help='Threshold de confiança')
-    
+    parser.add_argument('--image', default='')
+    parser.add_argument('--output', default='')
+    parser.add_argument('--conf-threshold', type=float, default=0.5)
+
     args = parser.parse_args()
-    
-    # Executar modo apropriado
+
     if args.mode == 'train':
         train_model(args)
     elif args.mode == 'test':
         test_model(args)
     elif args.mode == 'demo':
         if not args.image:
-            print("❌ Erro: --image é obrigatório no modo demo")
-            return
+            parser.error('--image é obrigatório no modo demo')
         demo(args)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

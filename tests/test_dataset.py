@@ -1,58 +1,68 @@
+﻿"""
+Teste unitário — DisfaDataset
+
+Usa diretório temporário com estrutura mínima de DISFA+.
+"""
 import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-root_dir = Path(__file__).parent.parent
-sys.path.insert(0, str(root_dir))
+import numpy as np
+import pytest
+import torch
+from PIL import Image
 
-from utils.dataset_loader import LandmarkDataset
+from utils.dataset_loader import DisfaDataset
+from config.settings import AU_NAMES
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("Testando LandmarkDataset")
-    print("=" * 60)
-    
-    # Exemplo com PTS format
-    dataset = LandmarkDataset(
-        root_dir="datasets/300W",
-        annotation_file="",  # Não usado para PTS
-        format='pts',
-        augment=False
-    )
 
-    print(f"\n📊 Dataset carregado:")
-    print(f"   Número de amostras: {len(dataset)}")
-    print(f"   Formato: PTS (300W)")
-    
-    # Testar primeira amostra
-    print(f"\n🔍 Testando primeira amostra...")
-    sample = dataset[0]
-    
-    print(f"\n✅ Amostra carregada com sucesso!")
-    print(f"   Image shape: {sample['image'].shape}")
-    print(f"   Landmarks shape: {sample['landmarks'].shape}")
-    print(f"   Visibility shape: {sample['visibility'].shape}")
-    print(f"   Original size: {sample['original_size']}")
-    
-    # Mostrar alguns landmarks
-    print(f"\n💡 Exemplos de landmarks (primeiros 5):")
-    for i in range(5):
-        x, y = sample['landmarks'][i]
-        vis = sample['visibility'][i]
-        print(f"   Landmark {i+1}: x={x:.4f}, y={y:.4f}, visible={vis:.0f}")
-    
-    # Testar múltiplas amostras
-    print(f"\n🔄 Testando 10 amostras aleatórias...")
-    import random
-    indices = random.sample(range(len(dataset)), min(10, len(dataset)))
-    
-    for idx in indices:
-        sample = dataset[idx]
-        assert sample['image'].shape == (3, 640, 640), f"Shape incorreto: {sample['image'].shape}"
-        assert sample['landmarks'].shape == (68, 2), f"Landmarks incorretos: {sample['landmarks'].shape}"
-        assert sample['visibility'].shape == (68,), f"Visibility incorreto: {sample['visibility'].shape}"
-    
-    print(f"   ✅ Todas as 10 amostras passaram nos testes!")
-    
-    print("\n" + "=" * 60)
-    print("✅ Teste concluído com sucesso!")
-    print("=" * 60)
+def _build_fake_disfa(tmp_path: Path, n_frames: int = 5) -> Path:
+    subject = "SN001"
+    session = "Session1"
+    img_dir = tmp_path / "Images" / subject / subject / session
+    lbl_dir = tmp_path / "Labels" / subject / subject / session
+    img_dir.mkdir(parents=True)
+    lbl_dir.mkdir(parents=True)
+
+    for i in range(n_frames):
+        img = Image.fromarray(np.zeros((200, 200, 3), dtype=np.uint8))
+        img.save(img_dir / f"{i:03d}.jpg")
+
+    for au in AU_NAMES:
+        lines = [f"{i:03d}.jpg\t{i % 4}\n" for i in range(n_frames)]
+        (lbl_dir / f"{au}.txt").write_text("".join(lines))
+
+    return tmp_path
+
+
+@pytest.fixture
+def fake_disfa(tmp_path):
+    return _build_fake_disfa(tmp_path)
+
+
+def test_dataset_len(fake_disfa):
+    ds = DisfaDataset(subjects=["SN001"], disfa_dir=fake_disfa)
+    assert len(ds) == 5
+
+
+def test_item_shapes(fake_disfa):
+    ds = DisfaDataset(subjects=["SN001"], disfa_dir=fake_disfa)
+    item = ds[0]
+    assert item["image"].shape == (3, 224, 224)
+    assert item["binary"].shape == (len(AU_NAMES),)
+    assert item["intensity"].shape == (len(AU_NAMES),)
+
+
+def test_binary_is_indicator(fake_disfa):
+    ds = DisfaDataset(subjects=["SN001"], disfa_dir=fake_disfa)
+    for i in range(len(ds)):
+        item = ds[i]
+        expected = (item["intensity"] > 0).float()
+        assert torch.allclose(item["binary"], expected)
+
+
+def test_pos_weight_shape(fake_disfa):
+    ds = DisfaDataset(subjects=["SN001"], disfa_dir=fake_disfa)
+    pw = ds.compute_pos_weight()
+    assert pw.shape == (len(AU_NAMES),)
+    assert (pw >= 0).all()
