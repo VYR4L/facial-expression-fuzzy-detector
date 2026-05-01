@@ -1,116 +1,215 @@
 """
-Inference - Inferência e Demonstração
+inference.py — Preditor de Action Units a partir de imagens completas.
 
-Responsável por:
-- Predição em imagens individuais
-- Visualização de landmarks
-- Demo/Inferência em tempo real
+Fluxo:
+    1. MediaPipe detecta rosto(s) na imagem completa
+    2. Crop + resize para (224, 224)
+    3. YOLOv11AUDetector prediz AUs
+    4. Retorna dict por AU com {'active': bool, 'intensity': float}
+
+Dependência opcional: mediapipe (pip install mediapipe)
 """
+from __future__ import annotations
 
-import torch
-import numpy as np
-import cv2
-from PIL import Image
 from pathlib import Path
+from typing import Union
+
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+from torchvision import transforms
+
+from config.settings import AU_NAMES, AU_DESCRIPTIONS, DEFAULT_IMAGE_CONFIG
 
 
-class LandmarkPredictor:
+_MEDIAPIPE_AVAILABLE = False
+try:
+    import mediapipe as mp
+    _MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    pass
+
+
+# ─── Preprocessamento ─────────────────────────────────────────────────────────
+
+def _build_transform(img_config=None):
+    cfg = img_config or DEFAULT_IMAGE_CONFIG
+    return transforms.Compose([
+        transforms.Resize((cfg.height, cfg.width)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=list(cfg.mean), std=list(cfg.std)),
+    ])
+
+
+def _crop_face_pil(image: Image.Image, bbox: tuple[float, float, float, float],
+                   margin: float = 0.15) -> Image.Image:
     """
-    Classe para inferência de landmarks em imagens
+    Recorta a região do rosto, com margem relativa ao tamanho do bounding box.
+
+    Args:
+        bbox: (xmin, ymin, xmax, ymax) normalizados [0, 1]
     """
-    def __init__(self, model, device, image_size=640):
-        self.model = model
+    w, h = image.size
+    xmin, ymin, xmax, ymax = bbox
+    bw = (xmax - xmin) * w
+    bh = (ymax - ymin) * h
+    x1 = max(0, (xmin * w) - margin * bw)
+    y1 = max(0, (ymin * h) - margin * bh)
+    x2 = min(w, (xmax * w) + margin * bw)
+    y2 = min(h, (ymax * h) + margin * bh)
+    return image.crop((x1, y1, x2, y2))
+
+
+# ─── Preditor principal ───────────────────────────────────────────────────────
+
+class AUPredictor:
+    """
+    Predição de Action Units a partir de uma imagem (arquivo ou tensor).
+
+    Quando MediaPipe está disponível, detecta rostos automaticamente.
+    Caso contrário, usa a imagem inteira como entrada (útil para imagens
+    já recortadas como no DISFA+).
+
+    Args:
+        model:          YOLOv11AUDetector (ou compatível) já carregado
+        device:         'cuda' ou 'cpu'
+        threshold:      limiar para classificação binária (padrão 0.5)
+        img_config:     configuração de imagem (tamanho, normalização)
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        device: str = 'cpu',
+        threshold: float = 0.5,
+        img_config=None,
+    ):
+        self.model = model.to(device).eval()
         self.device = device
-        self.image_size = image_size
-        self.model.eval()
-        
-        # ImageNet normalization
-        self.mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
-        self.std = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
+        self.threshold = threshold
+        self.transform = _build_transform(img_config)
 
-    def preprocess_image(self, image_path):
-        """Carrega e pré-processa imagem"""
-        # Carregar imagem
-        image = Image.open(image_path).convert('RGB')
-        original_size = image.size
-        
-        # Redimensionar
-        image_resized = image.resize((self.image_size, self.image_size), Image.BILINEAR)
-        image_array = np.array(image_resized, dtype=np.float32) / 255.0
-        
-        # Normalizar
-        image_array = (image_array - self.mean) / self.std
-        
-        # Para tensor
-        image_tensor = torch.from_numpy(np.transpose(image_array, (2, 0, 1))).float()
-        image_tensor = image_tensor.unsqueeze(0).to(self.device)
-        
-        return image_tensor, original_size, np.array(image)
+        # MediaPipe face detector (carregado sob demanda)
+        self._mp_face = None
+        if _MEDIAPIPE_AVAILABLE:
+            self._mp_face = mp.solutions.face_detection.FaceDetection(
+                model_selection=1,   # full-range model
+                min_detection_confidence=0.5,
+            )
+
+    # ── API pública ───────────────────────────────────────────────────────────
+
+    def predict_image(
+        self,
+        image: Union[str, Path, Image.Image, np.ndarray],
+    ) -> list[dict]:
+        """
+        Prediz AUs para cada rosto detectado na imagem.
+
+        Args:
+            image: caminho para arquivo, PIL Image ou ndarray HWC uint8
+
+        Returns:
+            Lista de dicts, um por rosto detectado:
+            {
+                'au_results': {
+                    'AU1': {'active': bool, 'intensity': float, 'description': str},
+                    ...
+                },
+                'bbox': (xmin, ymin, xmax, ymax)  # normalizados, ou None se imagem inteira
+            }
+        """
+        pil_img = self._load_pil(image)
+        face_crops = self._detect_faces(pil_img)
+
+        results = []
+        for crop, bbox in face_crops:
+            au_results = self._predict_crop(crop)
+            results.append({'au_results': au_results, 'bbox': bbox})
+
+        return results
+
+    def predict_file(self, path: Union[str, Path]) -> list[dict]:
+        return self.predict_image(path)
+
+    # ── Internals ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _load_pil(image) -> Image.Image:
+        if isinstance(image, (str, Path)):
+            return Image.open(image).convert('RGB')
+        if isinstance(image, np.ndarray):
+            return Image.fromarray(image).convert('RGB')
+        if isinstance(image, Image.Image):
+            return image.convert('RGB')
+        raise TypeError(f"Tipo de imagem não suportado: {type(image)}")
+
+    def _detect_faces(self, pil_img: Image.Image) -> list[tuple[Image.Image, tuple | None]]:
+        """
+        Detecta rostos com MediaPipe ou devolve a imagem inteira.
+
+        Returns:
+            Lista de (crop_pil, bbox) onde bbox é (xmin, ymin, xmax, ymax)
+            normalizados, ou None se a imagem foi usada inteira.
+        """
+        if self._mp_face is None:
+            return [(pil_img, None)]
+
+        img_np = np.array(pil_img)
+        mp_result = self._mp_face.process(img_np)
+
+        if not mp_result.detections:
+            # Nenhum rosto → usa imagem inteira
+            return [(pil_img, None)]
+
+        faces = []
+        for det in mp_result.detections:
+            bbox_mp = det.location_data.relative_bounding_box
+            xmin = max(0.0, bbox_mp.xmin)
+            ymin = max(0.0, bbox_mp.ymin)
+            xmax = min(1.0, xmin + bbox_mp.width)
+            ymax = min(1.0, ymin + bbox_mp.height)
+            crop = _crop_face_pil(pil_img, (xmin, ymin, xmax, ymax))
+            faces.append((crop, (xmin, ymin, xmax, ymax)))
+
+        return faces
 
     @torch.no_grad()
-    def predict(self, image_path, confidence_threshold=0.5):
-        """Prediz landmarks em uma imagem"""
-        # Pré-processar
-        image_tensor, original_size, original_image = self.preprocess_image(image_path)
-        
-        # Predição
-        landmarks, confidence, mask = self.model.predict_landmarks(
-            image_tensor,
-            confidence_threshold=confidence_threshold
-        )
-        
-        # Converter para coordenadas da imagem original
-        landmarks = landmarks[0].cpu().numpy()  # (68, 2)
-        confidence = confidence[0].cpu().numpy()  # (68,)
-        mask = mask[0].cpu().numpy()  # (68,)
-        
-        landmarks[:, 0] *= original_size[0]  # Escalar X
-        landmarks[:, 1] *= original_size[1]  # Escalar Y
-        
-        return landmarks, confidence, mask, original_image
+    def _predict_crop(self, crop: Image.Image) -> dict:
+        tensor = self.transform(crop).unsqueeze(0).to(self.device)  # (1, 3, H, W)
+        out = self.model(tensor)
 
-    def visualize_landmarks(self, image, landmarks, confidence, confidence_threshold=0.5):
-        """Desenha landmarks na imagem"""
-        image_cv = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        
-        for i, (x, y) in enumerate(landmarks):
-            conf = confidence[i]
-            # Verde se confiança alta, vermelho se baixa
-            color = (0, 255, 0) if conf > confidence_threshold else (0, 0, 255)
-            cv2.circle(image_cv, (int(x), int(y)), 2, color, -1)
-        
-        return image_cv
+        probs     = torch.sigmoid(out['binary_logits']).squeeze(0).cpu().numpy()
+        intensity = out['intensity'].squeeze(0).cpu().numpy()
 
-    def predict_and_save(self, image_path, output_path=None, confidence_threshold=0.5):
-        """Prediz landmarks e salva resultado"""
-        print(f"\n🖼️  Processando: {image_path}")
-        
-        # Predição
-        landmarks, confidence, mask, original_image = self.predict(
-            image_path, 
-            confidence_threshold
-        )
-        
-        # Visualizar
-        result_image = self.visualize_landmarks(
-            original_image, 
-            landmarks, 
-            confidence, 
-            confidence_threshold
-        )
-        
-        # Salvar
-        if output_path is None:
-            output_path = Path(image_path).with_stem(Path(image_path).stem + '_landmarks')
-        
-        cv2.imwrite(str(output_path), result_image)
-        
-        # Estatísticas
-        num_detected = mask.sum()
-        avg_confidence = confidence[mask].mean() if num_detected > 0 else 0
-        
-        print(f"✅ Resultado salvo em: {output_path}")
-        print(f"   Landmarks detectados: {num_detected}/68")
-        print(f"   Confidence média: {avg_confidence:.4f}")
-        
-        return landmarks, confidence, mask
+        au_results = {}
+        for i, au_name in enumerate(AU_NAMES):
+            au_results[au_name] = {
+                'active':      bool(probs[i] >= self.threshold),
+                'probability': float(probs[i]),
+                'intensity':   float(intensity[i]),
+                'description': AU_DESCRIPTIONS[au_name],
+            }
+        return au_results
+
+
+# ─── Utilitário para salvar resultados ────────────────────────────────────────
+
+def format_au_results(face_results: list[dict]) -> str:
+    """Formata a lista de resultados como texto legível."""
+    lines = []
+    for fi, face in enumerate(face_results):
+        lines.append(f"Rosto {fi + 1}:")
+        if face['bbox'] is not None:
+            x1, y1, x2, y2 = face['bbox']
+            lines.append(f"  BBox: ({x1:.3f}, {y1:.3f}, {x2:.3f}, {y2:.3f})")
+        lines.append(f"  {'AU':<8} {'Ativa':<8} {'Prob':>6} {'Intens':>7}  Descrição")
+        lines.append("  " + "-" * 55)
+        for au_name, info in face['au_results'].items():
+            marker = "✓" if info['active'] else " "
+            lines.append(
+                f"  {au_name:<8} {marker:<8} {info['probability']:>6.3f} "
+                f"{info['intensity']:>7.3f}  {info['description']}"
+            )
+    return "\n".join(lines)

@@ -1,67 +1,81 @@
 """
-Evaluator - Avaliação e Testes do Modelo
-
-Responsável por:
-- Testes do modelo
-- Métricas de avaliação
-- Inferência
+evaluator.py — Avalia um modelo AU em um DataLoader e persiste os resultados.
 """
+from pathlib import Path
 
 import torch
-from tqdm import tqdm
+from torch.utils.data import DataLoader
+
+from utils.metrics import AUMetrics
 
 
 class Evaluator:
     """
-    Classe para avaliar o modelo
+    Avalia um modelo de Action Units num DataLoader.
+
+    Args:
+        model:      instância do YOLOv11AUDetector (ou compatível)
+        device:     'cuda' ou 'cpu'
+        results_dir: diretório onde salvar os relatórios
     """
-    def __init__(self, model, criterion, device):
+
+    def __init__(self, model: torch.nn.Module, device: str = 'cpu',
+                 results_dir: str | Path = 'results'):
         self.model = model
-        self.criterion = criterion
         self.device = device
+        self.results_dir = Path(results_dir)
+        self.results_dir.mkdir(parents=True, exist_ok=True)
 
     @torch.no_grad()
-    def evaluate(self, dataloader):
-        """Avalia o modelo no dataset"""
-        self.model.eval()
-        
-        total_loss = 0
-        total_loc_loss = 0
-        total_conf_loss = 0
-        
-        print("\n🔍 Avaliando modelo...")
-        for batch in tqdm(dataloader, desc='Evaluating'):
-            images = batch['image'].to(self.device)
-            landmarks = batch['landmarks'].to(self.device)
-            visibility = batch['visibility'].to(self.device)
-            
-            predictions = self.model(images)
-            
-            targets = {
-                'landmarks': landmarks,
-                'visibility': visibility
-            }
-            losses = self.criterion(predictions, targets)
-            
-            total_loss += losses['loss'].item()
-            total_loc_loss += losses['loc_loss'].item()
-            total_conf_loss += losses['conf_loss'].item()
-        
-        avg_loss = total_loss / len(dataloader)
-        avg_loc_loss = total_loc_loss / len(dataloader)
-        avg_conf_loss = total_conf_loss / len(dataloader)
-        
-        return {
-            'loss': avg_loss,
-            'loc_loss': avg_loc_loss,
-            'conf_loss': avg_conf_loss
-        }
+    def evaluate(self, loader: DataLoader, threshold: float = 0.5) -> dict:
+        """
+        Roda inferência em todos os batches do loader e calcula métricas.
 
-    def print_results(self, results):
-        """Imprime resultados formatados"""
-        print("\n" + "=" * 70)
-        print("📊 Resultados da Avaliação:")
-        print(f"   Total Loss: {results['loss']:.4f}")
-        print(f"   Localization Loss: {results['loc_loss']:.4f}")
-        print(f"   Confidence Loss: {results['conf_loss']:.4f}")
-        print("=" * 70)
+        Args:
+            loader:    DataLoader com batches {'image', 'binary', 'intensity'}
+            threshold: limiar para decisão binária
+
+        Returns:
+            dict de métricas (ver AUMetrics.compute())
+        """
+        self.model.eval()
+        self.model.to(self.device)
+        metrics = AUMetrics()
+
+        for batch in loader:
+            images     = batch['image'].to(self.device)
+            binary     = batch['binary'].to(self.device)
+            intensity  = batch['intensity'].to(self.device)
+
+            predictions = self.model(images)
+            metrics.update(
+                predictions,
+                {'binary': binary, 'intensity': intensity},
+                threshold=threshold,
+            )
+
+        return metrics.compute()
+
+    def evaluate_and_save(
+        self,
+        loader: DataLoader,
+        filename: str = 'evaluation_report.txt',
+        threshold: float = 0.5,
+    ) -> dict:
+        """
+        Avalia e grava um relatório em texto no diretório de resultados.
+
+        Returns:
+            dict de métricas
+        """
+        results = self.evaluate(loader, threshold=threshold)
+
+        report_path = self.results_dir / filename
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write("=== Action Unit Detection — Evaluation Report ===\n\n")
+            f.write(AUMetrics.format_summary(results))
+            f.write("\n\n--- Detailed Classification Report ---\n")
+            f.write(results['classification_report'])
+
+        print(f"Relatório salvo em: {report_path}")
+        return results
