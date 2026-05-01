@@ -1,84 +1,61 @@
-# Face Expression Recognition With Fuzzy Logic 🎭
+# Face Expression Recognition With Fuzzy Logic
 
 <div align="center">
 
-**Sistema de Reconhecimento de Expressões Faciais usando YOLOv11 e Lógica Fuzzy**
+**Reconhecimento de Expressões Faciais via Action Units (FACS) + Lógica Fuzzy**
 
-[![Python](https://img.shields.io/badge/Python-3.13.5+-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.9+-orange.svg)](https://pytorch.org/)
-[![Status](https://img.shields.io/badge/Status-In%20Development-yellow.svg)](STATUS.md)
+[![Status](https://img.shields.io/badge/Status-Em%20Desenvolvimento-yellow.svg)]()
 </div>
 
 ---
 
-## 📖 Sobre o Projeto
+## Sobre o Projeto
 
-Este projeto implementa um sistema completo de **reconhecimento de expressões faciais** combinando técnicas de Deep Learning e Lógica Fuzzy. O sistema detecta 68 landmarks faciais usando uma arquitetura YOLOv11 customizada e classifica emoções através de um sistema fuzzy baseado em deformações geométricas.
+Este projeto implementa um sistema de **reconhecimento de expressões faciais** em dois estágios:
 
-Este projeto é parte de um Trabalho de Conclusão de Curso (TCC) da **Universidade Estadual do Oeste do Paraná (Unioeste)**.
+1. **Detecção de Action Units (AUs)** — uma rede YOLOv11 customizada classifica quais músculos faciais estão contraídos e com qual intensidade (escala 0–3), a partir do padrão FACS (*Facial Action Coding System*).
+2. **Inferência de emoção via Lógica Fuzzy** — as intensidades das AUs são mapeadas para emoções básicas (Alegria, Tristeza, Raiva, Medo, Desgosto, Surpresa) por um motor fuzzy com regras linguísticas interpretáveis.
 
-
-### 🎯 Objetivos
-
-- ✅ Detectar com precisão 68 landmarks faciais (padrão 300W/iBUG)
-- ✅ Calcular deformações geométricas em relação a uma face neutra
-- ✅ Classificar expressões faciais usando lógica fuzzy
-- ✅ Fornecer uma solução interpretável e robusta
-
-### 🏆 Destaques
-
-- **Arquitetura YOLOv11:** Estado da arte em detecção de objetos adaptada para landmarks
-- **Lógica Fuzzy:** Sistema interpretável com regras linguísticas
-- **Wing Loss:** Loss especializada para landmarks faciais
-- **Multi-escala:** Detecção em múltiplas resoluções (P3, P4, P5)
-- **Atenção Espacial:** Módulos C2PSA para melhor precisão
+O projeto é parte do Trabalho de Conclusão de Curso (TCC) da **Universidade Estadual do Oeste do Paraná (Unioeste)** — Ciência da Computação.
 
 ---
 
-## 🏗️ Arquitetura do Sistema
+## Arquitetura do Sistema
 
 ```
-┌──────────────────────┐
-│   INPUT IMAGE        │
-│   (3 x 640 x 640)    │
-└──────────┬───────────┘
+┌─────────────────────┐
+│    IMAGEM ENTRADA   │
+│    (3 × 224 × 224)  │
+└──────────┬──────────┘
            │
     ┌──────▼──────┐
     │  YOLOv11    │
-    │  Backbone   │
+    │  Backbone   │   C3K2 + SPFF
     └──────┬──────┘
-           │
-  ┌────────┼────────┐
-  │        │        │
-┌─▼─┐    ┌─▼─┐    ┌─▼─┐
-│P3 │    │P4 │    │P5 │
-└─┬─┘    └─┬─┘    └─┬─┘
-  │        │        │
-  └────────┼────────┘
-           │
+           │  P3, P4, P5
     ┌──────▼──────┐
     │  YOLOv11    │
-    │  Neck       │
-    │  (PANet)    │
+    │  Neck (PANet│   C2PSA (atenção espacial)
+    └──────┬──────┘
+           │  N3, N4, N5
+    ┌──────▼──────┐
+    │  AU Detection   │
+    │  Head       │   GAP → FC → dois ramos
     └──────┬──────┘
            │
-    ┌──────▼──────┐
-    │ Detection   │
-    │   Head      │
-    └──────┬──────┘
+   ┌───────┴────────┐
+   │                │
+┌──▼──────┐  ┌──────▼────┐
+│ binary  │  │ intensity │
+│ (12 AUs)│  │  (0 – 3)  │
+└──┬──────┘  └──────┬────┘
+   │                │
+   └───────┬────────┘
            │
     ┌──────▼──────┐
-    │68 Landmarks │
-    │(x, y, conf) │
-    └──────┬──────┘
-           │
-    ┌──────▼──────┐
-    │Deformações  │
-    │Geométricas  │
-    └──────┬──────┘
-           │
-    ┌──────▼──────┐
-    │Sistema Fuzzy│
+    │ Motor Fuzzy │   FACS → Emoção
     └──────┬──────┘
            │
     ┌──────▼──────┐
@@ -88,200 +65,205 @@ Este projeto é parte de um Trabalho de Conclusão de Curso (TCC) da **Universid
 
 ---
 
-## 📊 Estrutura dos Landmarks
+## Action Units Detectadas
 
-68 pontos do padrão 300W/iBUG:
+O modelo detecta as 12 AUs presentes no dataset DISFA+:
 
-| Região               | Índices    | Descrição                                      |
-|:--------------------|:-----------|:-----------------------------------------------|
-| Contorno facial      | **1–17**  | Mandíbula e formato geral do rosto             |
-| Sobrancelha esquerda | **18–22** | Arco e posição relativa                        |
-| Sobrancelha direita  | **23–27** | Arco e posição relativa                        |
-| Nariz                | **28–36** | 28–31: ponte / 32–36: base e narinas           |
-| Olho esquerdo        | **37–42** | Pálpebra, abertura e direção do olhar          |
-| Olho direito         | **43–48** | Pálpebra, abertura e direção do olhar          |
-| Boca                 | **49–68** | Lábios superior e inferior, abertura e sorriso |
+| AU   | Nome FACS               | Músculo principal          |
+|:-----|:------------------------|:---------------------------|
+| AU1  | Inner Brow Raise        | Frontal (parte medial)     |
+| AU2  | Outer Brow Raise        | Frontal (parte lateral)    |
+| AU4  | Brow Lowerer            | Corrugador / Prócero       |
+| AU5  | Upper Lid Raiser        | Levantador da pálpebra     |
+| AU6  | Cheek Raiser            | Zigomático menor           |
+| AU9  | Nose Wrinkler           | Levantador do lábio        |
+| AU12 | Lip Corner Puller       | Zigomático maior (sorriso) |
+| AU15 | Lip Corner Depressor    | Depressor do ângulo        |
+| AU17 | Chin Raiser             | Mental                     |
+| AU20 | Lip Stretcher           | Risório                    |
+| AU25 | Lips Part               | Depressor do lábio inferior|
+| AU26 | Jaw Drop                | Masseter (relaxamento)     |
 
----
+### Mapeamento FACS → Emoção
 
-## 🚀 Pipeline de Processamento
-
-### 1️⃣ YOLOv11 → Detecção de Landmarks
-
-A rede YOLOv11 customizada detecta diretamente os 68 landmarks faciais:
-
-- **Entrada:** Imagem RGB (640×640)
-- **Saída:** Matriz de coordenadas (68 × 3)
-  - `x, y`: Coordenadas normalizadas [0, 1]
-  - `confidence`: Score de confiança da detecção
-
-**Componentes:**
-- **Backbone:** Extração de features com blocos C3K2 e SPFF
-- **Neck:** PANet com atenção espacial (C2PSA)
-- **Head:** Detecção multi-escala com fusão de predições
-
-### 2️⃣ Cálculo de Deformações Geométricas
-
-A partir dos landmarks, calcula-se:
-- **Distâncias euclidianas** entre pontos chave
-- **Ângulos relativos** (sobrancelhas, boca)
-- **Relações normalizadas** comparando com face neutra
-
-**Fórmula:**
-
-$$d_{rel}(i, j) = \frac{ \| p_i - p_j \| - \| p_i^0 - p_j^0 \| }{ \| p_i^0 - p_j^0 \| }$$
-
-Onde:
-- $p_i = (x_i, y_i)$ → coordenadas do ponto $i$ na **imagem atual**
-- $p_i^0 = (x_i^0, y_i^0)$ → coordenadas do ponto $i$ na **face neutra**
-- $\| p_i - p_j \| = \sqrt{(x_i - x_j)^2 + (y_i - y_j)^2}$ → distância euclidiana
-
-**Interpretação:**
-- $d_{rel} > 0$ → **Expansão** (aumento da distância)
-- $d_{rel} < 0$ → **Contração** (redução da distância)
-- $d_{rel} \approx 0$ → **Sem variação** significativa
-
-### 3️⃣ Mapeamento Fuzzy das Deformações
-
-Variáveis linguísticas fuzzy:
-- `abertura_boca` → {baixa, média, alta}
-- `elevacao_sobrancelha` → {baixa, média, alta}
-- `abertura_olhos` → {baixa, média, alta}
-
-**Regras Fuzzy (exemplos):**
-```
-SE (boca_aberta = alta) E (olhos_abertos = altos) ENTÃO expressão = SURPRESA
-SE (boca_contraída = alta) E (sobrancelha_abaixada = alta) ENTÃO expressão = RAIVA
-SE (boca_sorriso = alto) E (olhos_semicerrados = médios) ENTÃO expressão = FELICIDADE
-```
-
-### 4️⃣ Inferência e Decisão
-
-O sistema fuzzy gera scores (0–1) para cada emoção usando:
-- **Método de Inferência:** Mamdani ou Sugeno
-- **Defuzzificação:** Centro de gravidade
-- **Saída:** Classe emocional + confidence
+| Emoção    | AUs prototípicas       |
+|:----------|:-----------------------|
+| Alegria   | AU6, AU12, AU25        |
+| Tristeza  | AU1, AU4, AU15, AU17   |
+| Raiva     | AU4, AU5, AU9, AU17    |
+| Medo      | AU1, AU2, AU4, AU5, AU20 |
+| Desgosto  | AU9, AU15, AU17        |
+| Surpresa  | AU1, AU2, AU5, AU26    |
 
 ---
 
-## 🛠️ Instalação
+## Pipeline de Processamento
+
+### Estágio 1 — Detecção de AUs (YOLOv11)
+
+**Entrada:** imagem facial RGB (224×224)
+
+**Head (AUDetectionHead):**
+- Recebe features N3, N4, N5 do Neck
+- Global Average Pooling em cada escala → concatenação
+- Camada compartilhada FC → dois ramos paralelos:
+  - **Ramo binário:** 12 logits → `BCEWithLogitsLoss`
+  - **Ramo de intensidade:** 12 valores ∈ [0, 3] → `SmoothL1Loss`
+
+**Saída:**
+```python
+{
+    'binary_logits': Tensor(B, 12),  # sigmoid → probabilidade de ativação
+    'intensity':     Tensor(B, 12),  # intensidade contínua 0–3
+}
+```
+
+**Loss combinada:**
+
+$$\mathcal{L} = \lambda_{bce} \cdot \mathcal{L}_{BCE} + \lambda_{l1} \cdot \mathcal{L}_{SmoothL1}$$
+
+onde $\mathcal{L}_{SmoothL1}$ é calculada apenas nos frames em que a AU está ativa.
+
+### Estágio 2 — Inferência Fuzzy
+
+As intensidades contínuas das AUs alimentam um motor fuzzy:
+- **Variáveis de entrada:** intensidade de cada AU (0–3)
+- **Variáveis linguísticas:** {ausente, fraca, moderada, forte}
+- **Regras:** baseadas no mapeamento FACS acima
+- **Saída:** score de pertinência por emoção → classe final
+
+---
+
+## Dataset
+
+O modelo é treinado no **DISFA+** (*Denver Intensity of Spontaneous Facial Actions*):
+
+- **9 sujeitos:** SN001, SN003, SN004, SN007, SN009, SN010, SN013, SN025, SN027
+- **~130 000 frames** de vídeos de expressões espontâneas
+- **Anotações:** intensidade por AU por frame (0–3), feitas por especialistas FACS
+- **Imagens:** faces recortadas 200×200 px
+
+Estrutura esperada em disco:
+```
+datasets/archive/
+├── Images/
+│   └── SN001/SN001/<sessão>/<frame>.jpg
+└── Labels/
+    └── SN001/SN001/<sessão>/AU1.txt
+                             AU2.txt
+                             ...
+```
+
+---
+
+## Instalação
 
 ### Pré-requisitos
 
-- Python 3.13.5+
-- CUDA 11.8+ (opcional, para GPU)
+- Python 3.11+
+- CUDA 12.1+ (recomendado)
 
-### Instalação Rápida
+### Setup
 
 ```bash
-# Clonar repositório
 git clone https://github.com/seu-usuario/Fer-With-Fuzzy.git
 cd Fer-With-Fuzzy
 
-# Criar ambiente virtual
 python -m venv venv
-venv\Scripts\activate  # Windows
-# source venv/bin/activate  # Linux/Mac
+# Windows:
+venv\Scripts\activate
+# Linux/Mac:
+source venv/bin/activate
 
-# Instalar PyTorch com CUDA
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# PyTorch com CUDA
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-# Instalar dependências
+# Demais dependências
 pip install -r requirements.txt
 ```
 
 ---
 
-## 💻 Exemplos de Uso
+## Uso
 
 ### Treinamento
 
 ```bash
-# Básico
-python main.py --mode train --data-dir datasets/300W --epochs 100
+# Padrão (8 sujeitos treino, 1 validação)
+python main.py --mode train --epochs 50 --batch-size 4
 
-# Com configurações customizadas
-python main.py \
-    --mode train \
-    --data-dir datasets/300W \
-    --epochs 200 \
-    --batch-size 32 \
-    --lr 0.001 \
-    --base-channels 64
+# Com mais épocas e learning rate menor
+python main.py --mode train --epochs 100 --batch-size 4 --lr 5e-5
 ```
 
-### Teste/Avaliação
+### Avaliação
 
 ```bash
-python main.py \
-    --mode test \
-    --weights checkpoints/best_model.pth \
-    --data-dir datasets/300W
+python main.py --mode test --weights checkpoints/best_model.pth
 ```
 
-### Demo/Inferência
+O relatório é salvo em `results/evaluation_report.txt` com F1 por AU, mAP e MAE de intensidade.
+
+### Demo (imagem completa)
 
 ```bash
-python main.py \
-    --mode demo \
-    --image examples/face.jpg \
-    --weights checkpoints/best_model.pth \
-    --output results/face_landmarks.jpg
+python main.py --mode demo --image foto.jpg --weights checkpoints/best_model.pth
 ```
 
-### Uso Programático
+Detecta rostos automaticamente via MediaPipe e exibe as AUs ativas com suas intensidades.
+
+### Uso programático
 
 ```python
 import torch
-from core import YOLOv11LandmarkDetector
+from core import YOLOv11AUDetector
 
-# Carregar modelo
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = YOLOv11LandmarkDetector().to(device)
-checkpoint = torch.load('checkpoints/best_model.pth')
+model = YOLOv11AUDetector().to(device)
+checkpoint = torch.load('checkpoints/best_model.pth', map_location=device)
 model.load_state_dict(checkpoint['model_state_dict'])
-model.eval()
 
-# Predição
-with torch.no_grad():
-    landmarks, confidence, mask = model.predict_landmarks(image_tensor)
-
-print(f"Landmarks detectados: {mask.sum()}/68")
+# Predição com threshold
+pred = model.predict(image_tensor, binary_threshold=0.5)
+# pred['binary']:    (B, 12) bool
+# pred['intensity']: (B, 12) float [0, 3]
 ```
 
 ---
 
-## 📂 Estrutura do Projeto
+## Testes
+
+```bash
+# Testes sem necessidade do dataset DISFA+
+python -m pytest tests/test_model.py tests/test_au_loss.py -v
+
+# Suite completa (requer dataset)
+python -m pytest tests/ -v
+```
+
+---
+
+## Estrutura do Projeto
 
 ```
 Fer-With-Fuzzy/
-├── blocks/              # Blocos da rede (C3K2, C2PSA, SPFF)
-├── core/               # Arquitetura principal (Backbone, Neck, Head)
-├── utils/              # Dataset loader, Loss functions
-├── config/             # Configurações do sistema
-├── tests/              # Testes unitários
-├── datasets/           # Datasets (300W)
-├── checkpoints/        # Modelos treinados
-├── main.py            # Script principal
-├── README.md          # Este arquivo
-├── USAGE.md           # Guia detalhado
-└── STATUS.md          # Status do projeto
+├── blocks/              # Blocos YOLOv11 (Conv, C3K2, C2PSA, SPFF, Bottleneck)
+├── core/                # Backbone, Neck, AUDetectionHead, YOLOv11AUDetector
+├── utils/               # DisfaDataset, AULoss, AUMetrics, Trainer, Evaluator, AUPredictor
+├── config/              # Configurações globais (AUs, FACS, ImageConfig, etc.)
+├── tests/               # Testes unitários
+├── datasets/archive/    # Dataset DISFA+ (Images/ + Labels/)
+├── checkpoints/         # Pesos do modelo
+├── results/             # Relatórios de avaliação
+└── main.py              # Ponto de entrada (train / test / demo)
 ```
 
 ---
 
-## 👥 Autores
+## Autores
 
 - **Desenvolvedor:** Felipe Kravec Zanatta
-- **Orientador:** Adriana Postal
-- **Instituição:** Unioeste - Universidade Estadual do Oeste do Paraná
+- **Orientadora:** Adriana Postal
+- **Instituição:** Unioeste — Universidade Estadual do Oeste do Paraná
 - **Curso:** Ciência da Computação
-- **Ano:** 2025
----
-
-<div align="center">
-
-**⭐ Se este projeto foi útil, considere dar uma estrela!**
-
-
-</div>
+- **Ano:** 2025–2026
